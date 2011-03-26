@@ -1,0 +1,22 @@
+This little repo holds the userspace utilities needed to connect
+and disconnect from the Verizon 4G network using their VL600
+mobile modem usb dongle, made by LG Electronics.  The kernel
+patch to enable actual network communication is also in this
+repository until it finds its way upstream, once it works
+reliably.
+
+The scripts also need to be cleaned-up, the protocol needs more
+researching and finally the userspace part should all be integrated
+into projects like oFono, connman, NetworkManager, etc. so that
+no scripts are needed.
+
+vl600-attach.py makes the dongle connect to the network.
+vl600-detatch.py disconnects from network before the dongle
+  is removed from USB port (not sure this is needed, but just
+  in case) -- re-attaching without unpluggin the dongle doesn't
+  usually work, yet.
+vl600-com.py gives you a AT commands terminal for talking to
+  the modem.  Honestly it's quite useless because the modem
+  firmware's idea of "AT commands" is so far from 3GPP standards,
+  there's practically no command that works correctly on this
+  modem.
