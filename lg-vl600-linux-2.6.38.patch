@@ -21,7 +21,7 @@ port.
  drivers/net/usb/Kconfig     |   15 ++
  drivers/net/usb/Makefile    |    1 +
  drivers/net/usb/cdc_ether.c |   21 ++-
- drivers/net/usb/lg-vl600.c  |  322 +++++++++++++++++++++++++++++++++++++++++++
+ drivers/net/usb/lg-vl600.c  |  325 +++++++++++++++++++++++++++++++++++++++++++
  include/linux/usb/usbnet.h  |    4 +-
  5 files changed, 356 insertions(+), 7 deletions(-)
  create mode 100644 drivers/net/usb/lg-vl600.c
@@ -134,7 +134,7 @@ new file mode 100644
 index 0000000..4f54661
 --- /dev/null
 +++ b/drivers/net/usb/lg-vl600.c
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,325 @@
 +/*
 + * Ethernet interface part of the LG VL600 LTE modem (4G dongle)
 + *
@@ -278,7 +278,10 @@ index 0000000..4f54661
 +	struct sk_buff *clone;
 +
 +	frame = (struct vl600_frame_hdr *) skb->data;
-+	if ((skb->len & 3) || skb->len < sizeof(*frame) ||
++	/* Frame lengths are generally 4B multiplies but every couple of
++	 * hours there's an odd number of bytes sized yet correct frame,
++	 * so don't check for this. */
++	if (skb->len < sizeof(*frame) ||
 +			skb->len != le32_to_cpup(&frame->len)) {
 +		netif_err(dev, ifup, dev->net, "Invalid frame length");
 +		dev->net->stats.rx_length_errors++;
