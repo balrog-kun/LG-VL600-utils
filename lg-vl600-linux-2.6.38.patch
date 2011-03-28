@@ -1,33 +1,42 @@
 From a6f903454fd3ba3b60a0b3e1ef3419f5b201aa3e Mon Sep 17 00:00:00 2001
 From: Andrzej Zaborowski <andrew.zaborowski@intel.com>
 Date: Sat, 26 Mar 2011 11:55:00 +0100
-Subject: [PATCH] Ethernet quirks for the LG-VL600 4G usb modem
+Subject: [PATCH] net/usb: Ethernet quirks for the LG-VL600 4G modem
 
+This adds a driver for the CDC Ethernet part of this modem.  The
+device's ID is blacklisted in cdc_ether.c and is white-listed in
+this new driver because of the quirks needed to make it useful.
 The modem's firmware exposes a CDC ACM port for modem control and a
 CDC Ethernet port for network data.  The descriptors look fine but
 both ports actually are some sort of multiplexers requiring non-
-standard headers added/removed from every packet.  The CDC Ethernet
-port is not even a real ethernet interface because the ethernet
-header is stripped away from packets and only packets sent to/from the
-gateway IP are allowed.  Treating it as an ethernet interface allows
-us to reuse CDC driver code and the userspace code like the DHCP
-client.  All information is based on a usb traffic log from a Windows
-machine.
+standard headers added/removed from every packet or else they're
+ignored.  The CDC Ethernet port is not technically an ethernet
+interface because the ethernet header is stripped away from packets
+and only packets sent to/from the gateway IP are allowed.  But
+treating it like an ethernet interface lets us to reuse a lot of
+driver code and userspace code like DHCP.  All information is
+based on a usb traffic log from a Windows machine.
 
-On the Verizon 4G network I've seen speeds up to 1.2MB/s so far, with
-this driver.  Userspace scripts are required to talk to the CDC ACM
-port.
+Comments on how to improve the code are welcome.  Note that
+usb_skb_return is used in tx_fixup without a bottom half, which
+other drivers don't do.
+
+On the Verizon 4G network I've seen speeds up to 1.1MB/s so far with
+this driver, a speed-o-meter site reports 16.2Mbps/10.5Mbps.
+Userspace scripts are required to talk to the CDC ACM port.
+
+Signed-off-by: Andrzej Zaborowski <balrogg@gmail.com>
 ---
  drivers/net/usb/Kconfig     |   15 ++
  drivers/net/usb/Makefile    |    1 +
  drivers/net/usb/cdc_ether.c |   21 ++-
- drivers/net/usb/lg-vl600.c  |  325 +++++++++++++++++++++++++++++++++++++++++++
- include/linux/usb/usbnet.h  |    4 +-
+ drivers/net/usb/lg-vl600.c  |  346 +++++++++++++++++++++++++++++++++++++++++++
+ include/linux/usb/usbnet.h  |    3 +-
  5 files changed, 356 insertions(+), 7 deletions(-)
  create mode 100644 drivers/net/usb/lg-vl600.c
 
 diff --git a/drivers/net/usb/Kconfig b/drivers/net/usb/Kconfig
-index 6f600cc..b849017 100644
+index 6f600cc..3ec22c3 100644
 --- a/drivers/net/usb/Kconfig
 +++ b/drivers/net/usb/Kconfig
 @@ -433,4 +433,19 @@ config USB_SIERRA_NET
@@ -61,7 +70,7 @@ index cac1703..c7ec8a5 100644
 +obj-$(CONFIG_USB_VL600)		+= lg-vl600.o
  
 diff --git a/drivers/net/usb/cdc_ether.c b/drivers/net/usb/cdc_ether.c
-index 9a60e41..8bcb3d9 100644
+index 9a60e41..51c259b 100644
 --- a/drivers/net/usb/cdc_ether.c
 +++ b/drivers/net/usb/cdc_ether.c
 @@ -378,7 +378,7 @@ static void dumpspeed(struct usbnet *dev, __le32 *speeds)
@@ -108,7 +117,7 @@ index 9a60e41..8bcb3d9 100644
  	.description =	"Mobile Broadband Network Device",
  	.flags =	FLAG_WWAN,
 -	.bind = 	cdc_bind,
-+	.bind = 	usbnet_cdc_bind,
++	.bind =		usbnet_cdc_bind,
  	.unbind =	usbnet_cdc_unbind,
 -	.status =	cdc_status,
 +	.status =	usbnet_cdc_status,
@@ -131,15 +140,15 @@ index 9a60e41..8bcb3d9 100644
   *
 diff --git a/drivers/net/usb/lg-vl600.c b/drivers/net/usb/lg-vl600.c
 new file mode 100644
-index 0000000..4f54661
+index 0000000..f9a7ced
 --- /dev/null
 +++ b/drivers/net/usb/lg-vl600.c
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,346 @@
 +/*
 + * Ethernet interface part of the LG VL600 LTE modem (4G dongle)
 + *
-+ * Copyright (C) 2011 Intel Corportation
-+ * Author: Andrzej Zaborowski <andrew.zaborowski@intel.com>
++ * Copyright (C) 2011 Intel Corporation
++ * Author: Andrzej Zaborowski <balrogg@gmail.com>
 + *
 + * This program is free software; you can redistribute it and/or modify
 + * it under the terms of the GNU General Public License as published by
@@ -168,7 +177,7 @@ index 0000000..4f54661
 +/*
 + * The device has a CDC ACM port for modem control (it claims to be
 + * CDC ACM anyway) and a CDC Ethernet port for actual network data.
-+ * It will however ignore data on both ports that is not encapsulated 
++ * It will however ignore data on both ports that is not encapsulated
 + * in a specific way, any data returned is also encapsulated the same
 + * way.  The headers don't seem to follow any popular standard.
 + *
@@ -198,75 +207,48 @@ index 0000000..4f54661
 +	__be16 h_proto;
 +} __attribute__((packed));
 +
-+/* Note: Turbo-hack! The modem firmware (or someone on the Verizon
-+ * network side) works as a DHCP server and gateway between us and
-+ * the intarwebs.  It has a dynamically assigned IP address on the
-+ * same subnet as our IP and all communications goes through it.
-+ * Effectively the subnet can contain only exactly two hosts (local
-+ * and remote) and thus hardware addresses have no meaning any more
-+ * making the ARP layer useless.  The source and the destination of
-+ * each packet on the IN and on the OUT endpoints are known and are
-+ * not included in the usb frames unlike on real ethernet.
-+ * Apparently someone has noticed that ARP is not needed and the
-+ * remote host doesn't bother answering ARP requests.  So we look
-+ * for ARP requests in vl600_tx_fixup and we fake a response from
-+ * the remote side containing a fake hardware address.
-+ */
-+static int vl600_handle_arp(struct usbnet *dev, struct sk_buff *skb)
++struct vl600_state {
++	struct sk_buff *current_rx_buf;
++};
++
++static int vl600_bind(struct usbnet *dev, struct usb_interface *intf)
 +{
-+	struct sk_buff *resp;
-+	struct ethhdr *eth_req, *eth_resp;
-+	struct arphdr *arp_req, *arp_resp;
-+	int arp_len = arp_hdr_len(dev->net);
-+	struct in_device *in_dev = dev->net->ip_ptr;
++	int ret;
++	struct vl600_state *s = kzalloc(sizeof(struct vl600_state), GFP_KERNEL);
 +
-+	if (skb->len < sizeof(*eth_resp) + arp_len)
-+		return 0;
++	if (!s)
++		return -ENOMEM;
 +
-+	arp_req = (struct arphdr *) (skb->data + sizeof(*eth_req));
-+	if (be16_to_cpup(&arp_req->ar_hrd) != ARPHRD_ETHER ||
-+			be16_to_cpup(&arp_req->ar_pro) != ETH_P_IP ||
-+			arp_req->ar_hln != ETH_ALEN ||
-+			arp_req->ar_pln != 4 ||
-+			be16_to_cpup(&arp_req->ar_op) != ARPOP_REQUEST)
-+		return 0;
++	ret = usbnet_cdc_bind(dev, intf);
++	if (ret) {
++		kfree(s);
++		return ret;
++	}
 +
-+	if (!in_dev || !in_dev->ifa_list)
-+		return 0;
++	dev->driver_priv = s;
 +
-+	/* This is a poor check that this request is not just ourselves asking
-+	 * if the address proposed to us by DHCP is taken.. */
-+	if (!memcmp(skb->data + sizeof(*eth_req) + sizeof(*arp_req) + ETH_ALEN,
-+				"\0\0\0\0", 4))
-+		return 0;
++	/* ARP packets don't go through, but they're also of no use.  The
++	 * subnet has only two hosts anyway: us and the gateway / DHCP
++	 * server (probably simulated by modem firmware or network operator)
++	 * whose address changes everytime we connect to the intarwebz and
++	 * who doesn't bother answering ARP requests either.  So hardware
++	 * addresses have no meaning, the destination and the source of every
++	 * packet depend only on whether it is on the IN or OUT endpoint.  */
++	dev->net->flags |= IFF_NOARP;
 +
-+	/* Build response packet */
-+	resp = dev_alloc_skb(sizeof(*eth_resp) + arp_len);
++	return ret;
++}
 +
-+	eth_req = (struct ethhdr *) skb->data;
-+	eth_resp = (struct ethhdr *) skb_put(resp, sizeof(*eth_resp));
-+	eth_resp->h_proto = eth_req->h_proto;
-+	memcpy(&eth_resp->h_dest, eth_req->h_source, ETH_ALEN);
-+	memset(&eth_resp->h_source, 0, ETH_ALEN);
++static void vl600_unbind(struct usbnet *dev, struct usb_interface *intf)
++{
++	struct vl600_state *s = dev->driver_priv;
 +
-+	arp_req = (struct arphdr *) (skb->data + sizeof(*eth_req));
-+	arp_resp = (struct arphdr *) skb_put(resp, sizeof(*arp_resp));
-+	arp_resp->ar_hrd = arp_req->ar_hrd;
-+	arp_resp->ar_pro = arp_req->ar_pro;
-+	arp_resp->ar_hln = arp_req->ar_hln;
-+	arp_resp->ar_pln = arp_req->ar_pln;
-+	arp_resp->ar_op = cpu_to_be16(ARPOP_REPLY);
++	if (s->current_rx_buf)
++		dev_kfree_skb(s->current_rx_buf);
 +
-+	memcpy(skb_put(resp, ETH_ALEN + 4),
-+			skb->data + sizeof(*eth_req) + sizeof(*arp_req) +
-+			ETH_ALEN + 4, ETH_ALEN + 4);
-+	memcpy(skb_put(resp, ETH_ALEN + 4),
-+			skb->data + sizeof(*eth_req) + sizeof(*arp_req),
-+			ETH_ALEN + 4);
++	kfree(s);
 +
-+	usbnet_skb_return(dev, resp);
-+
-+	return 1;
++	return usbnet_cdc_unbind(dev, intf);
 +}
 +
 +static int vl600_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
@@ -275,74 +257,126 @@ index 0000000..4f54661
 +	struct vl600_pkt_hdr *packet;
 +	struct ethhdr *ethhdr;
 +	int packet_len, count;
++	struct sk_buff *buf = skb;
 +	struct sk_buff *clone;
++	struct vl600_state *s = dev->driver_priv;
 +
-+	frame = (struct vl600_frame_hdr *) skb->data;
 +	/* Frame lengths are generally 4B multiplies but every couple of
 +	 * hours there's an odd number of bytes sized yet correct frame,
-+	 * so don't check for this. */
-+	if (skb->len < sizeof(*frame) ||
-+			skb->len != le32_to_cpup(&frame->len)) {
-+		netif_err(dev, ifup, dev->net, "Invalid frame length");
++	 * so don't require this.  */
++
++	/* Allow a packet (or multiple packets batched together) to be
++	 * split across many frames.  We don't allow a new batch to
++	 * begin in the same frame another one is ending however, and no
++	 * leading or trailing pad bytes.  */
++	if (s->current_rx_buf) {
++		frame = (struct vl600_frame_hdr *) s->current_rx_buf->data;
++		if (skb->len + s->current_rx_buf->len >
++				le32_to_cpup(&frame->len)) {
++			netif_err(dev, ifup, dev->net, "Fragment too long\n");
++			dev->net->stats.rx_length_errors++;
++			goto error;
++		}
++
++		buf = s->current_rx_buf;
++		memcpy(skb_put(buf, skb->len), skb->data, skb->len);
++	} else if (skb->len < 4) {
++		netif_err(dev, ifup, dev->net, "Frame too short\n");
 +		dev->net->stats.rx_length_errors++;
++		goto error;
++	}
++
++	frame = (struct vl600_frame_hdr *) buf->data;
++	/* NOTE: Should check that frame->magic == 0x53544448?
++	 * Otherwise if we receive garbage at the beginning of the frame
++	 * we may end up allocating a huge buffer and saving all the
++	 * future incoming data into it.  */
++
++	if (buf->len < sizeof(*frame) ||
++			buf->len != le32_to_cpup(&frame->len)) {
++		/* Save this fragment for later assembly */
++		if (s->current_rx_buf)
++			return 0;
++
++		s->current_rx_buf = skb_copy_expand(skb, 0,
++				le32_to_cpup(&frame->len), GFP_ATOMIC);
++		if (!s->current_rx_buf) {
++			netif_err(dev, ifup, dev->net, "Reserving %i bytes "
++					"for packet assembly failed.\n",
++					le32_to_cpup(&frame->len));
++			dev->net->stats.rx_errors++;
++		}
++
 +		return 0;
 +	}
 +
-+	/* Should check that frame->magic == 0x53544448 or so? */
-+
 +	count = le32_to_cpup(&frame->pkt_cnt);
 +
-+	skb_pull(skb, sizeof(*frame));
++	skb_pull(buf, sizeof(*frame));
 +
 +	while (count--) {
-+		if (skb->len < sizeof(*packet) ) {
-+			netif_err(dev, ifup, dev->net, "Frame too short");
-+			dev->net->stats.rx_errors++;
-+			return 0;
++		if (buf->len < sizeof(*packet)) {
++			netif_err(dev, ifup, dev->net, "Packet too short\n");
++			goto error;
 +		}
 +
-+		packet = (struct vl600_pkt_hdr *) skb->data;
++		packet = (struct vl600_pkt_hdr *) buf->data;
 +		packet_len = sizeof(*packet) + le32_to_cpup(&packet->len);
-+		if (packet_len > skb->len) {
++		if (packet_len > buf->len) {
 +			netif_err(dev, ifup, dev->net,
-+					"Bad packet length stored in header");
-+			dev->net->stats.rx_errors++;
-+			return 0;
++					"Bad packet length stored in header\n");
++			goto error;
 +		}
 +
-+		/* Packet header is same size as ethernet packet header
++		/* Packet header is same size as the ethernet header
 +		 * (sizeof(*packet) == sizeof(*ethhdr)), additionally
 +		 * the h_proto field is in the same place so we just leave it
 +		 * alone and fill in the remaining fields.
 +		 */
 +		ethhdr = (struct ethhdr *) skb->data;
 +		if (be16_to_cpup(&ethhdr->h_proto) == ETH_P_ARP &&
-+				skb->len > 0x26) {
++				buf->len > 0x26) {
 +			/* Copy the addresses from packet contents */
 +			memcpy(ethhdr->h_source,
-+					&skb->data[sizeof(*ethhdr) + 0x8],
++					&buf->data[sizeof(*ethhdr) + 0x8],
 +					ETH_ALEN);
 +			memcpy(ethhdr->h_dest,
-+					&skb->data[sizeof(*ethhdr) + 0x12],
++					&buf->data[sizeof(*ethhdr) + 0x12],
 +					ETH_ALEN);
 +		} else {
 +			memset(ethhdr->h_source, 0, ETH_ALEN);
-+			memcpy(ethhdr->h_dest, &dev->net->dev_addr, ETH_ALEN);
++			memcpy(ethhdr->h_dest, dev->net->dev_addr, ETH_ALEN);
 +		}
 +
 +		if (count) {
 +			/* Not the last packet in this batch */
-+			clone = skb_clone(skb, GFP_ATOMIC);
++			clone = skb_clone(buf, GFP_ATOMIC);
++			if (!clone)
++				goto error;
++
 +			skb_trim(clone, packet_len);
 +			usbnet_skb_return(dev, clone);
 +
-+			skb_pull(skb, (packet_len + 3) & ~3);
++			skb_pull(buf, (packet_len + 3) & ~3);
 +		} else {
-+			skb_trim(skb, packet_len);
++			skb_trim(buf, packet_len);
++
++			if (s->current_rx_buf) {
++				usbnet_skb_return(dev, buf);
++				s->current_rx_buf = NULL;
++				return 0;
++			}
++
 +			return 1;
 +		}
 +	}
 +
++error:
++	if (s->current_rx_buf) {
++		dev_kfree_skb_any(s->current_rx_buf);
++		s->current_rx_buf = NULL;
++	}
++	dev->net->stats.rx_errors++;
 +	return 0;
 +}
 +
@@ -363,12 +397,6 @@ index 0000000..4f54661
 +	if (skb->len < sizeof(struct ethhdr))
 +		/* Drop, device can only deal with ethernet packets */
 +		return NULL;
-+
-+	packet = (struct vl600_pkt_hdr *) skb->data;
-+	if (be16_to_cpup(&packet->h_proto) == ETH_P_ARP)
-+		if (vl600_handle_arp(dev, skb))
-+			/* Drop if response faked */
-+			return NULL;
 +
 +	if (!skb_cloned(skb)) {
 +		int headroom = skb_headroom(skb);
@@ -420,9 +448,9 @@ index 0000000..4f54661
 +
 +static const struct driver_info	vl600_info = {
 +	.description	= "LG VL600 modem",
-+	.flags		= FLAG_ETHER,
-+	.bind		= usbnet_cdc_bind,
-+	.unbind		= usbnet_cdc_unbind,
++	.flags		= FLAG_ETHER | FLAG_RX_ASSEMBLE,
++	.bind		= vl600_bind,
++	.unbind		= vl600_unbind,
 +	.status		= usbnet_cdc_status,
 +	.rx_fixup	= vl600_rx_fixup,
 +	.tx_fixup	= vl600_tx_fixup,
@@ -459,18 +487,56 @@ index 0000000..4f54661
 +}
 +module_exit(vl600_exit);
 +
++MODULE_AUTHOR("Anrzej Zaborowski");
++MODULE_DESCRIPTION("LG-VL600 modem's ethernet link");
 +MODULE_LICENSE("GPL");
+diff --git a/drivers/net/usb/usbnet.c b/drivers/net/usb/usbnet.c
+index 95c41d5..cf58b76 100644
+--- a/drivers/net/usb/usbnet.c
++++ b/drivers/net/usb/usbnet.c
+@@ -387,8 +387,12 @@ static int rx_submit (struct usbnet *dev, struct urb *urb, gfp_t flags)
+ static inline void rx_process (struct usbnet *dev, struct sk_buff *skb)
+ {
+ 	if (dev->driver_info->rx_fixup &&
+-	    !dev->driver_info->rx_fixup (dev, skb))
+-		goto error;
++	    !dev->driver_info->rx_fixup (dev, skb)) {
++		/* With RX_ASSEMBLE, rx_fixup() must update counters */
++		if (!(dev->driver_info->flags & FLAG_RX_ASSEMBLE))
++			dev->net->stats.rx_errors++;
++		goto done;
++	}
+ 	// else network stack removes extra byte if we forced a short packet
+ 
+ 	if (skb->len) {
+@@ -401,8 +405,8 @@ static inline void rx_process (struct usbnet *dev, struct sk_buff *skb)
+ 	}
+ 
+ 	netif_dbg(dev, rx_err, dev->net, "drop\n");
+-error:
+ 	dev->net->stats.rx_errors++;
++done:
+ 	skb_queue_tail(&dev->done, skb);
+ }
+ 
 diff --git a/include/linux/usb/usbnet.h b/include/linux/usb/usbnet.h
-index 44842c8..3bef970 100644
+index 44842c8..201f222 100644
 --- a/include/linux/usb/usbnet.h
 +++ b/include/linux/usb/usbnet.h
-@@ -172,7 +172,9 @@ struct cdc_state {
+@@ -102,6 +102,7 @@ struct driver_info {
+  * Affects statistic (counters) and short packet handling.
+  */
+ #define FLAG_MULTI_PACKET	0x1000
++#define FLAG_RX_ASSEMBLE	0x2000	/* rx packets may span >1 frames */
+ 
+ 	/* init device ... can sleep, or cause probe() failure */
+ 	int	(*bind)(struct usbnet *, struct usb_interface *);
+@@ -172,7 +173,9 @@ struct cdc_state {
  };
  
  extern int usbnet_generic_cdc_bind(struct usbnet *, struct usb_interface *);
--extern void usbnet_cdc_unbind(struct usbnet *, struct usb_interface *);
 +extern int usbnet_cdc_bind(struct usbnet *, struct usb_interface *);
-+extern void usbnet_cdc_unbind (struct usbnet *, struct usb_interface *);
+ extern void usbnet_cdc_unbind(struct usbnet *, struct usb_interface *);
 +extern void usbnet_cdc_status(struct usbnet *, struct urb *);
  
  /* CDC and RNDIS support the same host-chosen packet filters for IN transfers */
