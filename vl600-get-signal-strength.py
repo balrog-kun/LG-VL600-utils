@@ -102,10 +102,12 @@ try:
 	line = line.strip('\r\n')
 	if line[0:6] != "+CSQ: ":
 		raise Exception("Parse error: " + repr(line))
-	line = line[6:].strip().split(",")
-	if len(line) != 2:
-		raise Exception("Parse error: " + repr(line))
-	print(str(int(int(line[0]) * 100 / 31 + 0.5)) + "%")
+	ss, battery = line[6:].strip().split(",")
+	ss = int(ss)
+	if ss == 99:
+		print('Unknown')
+	else:
+		print(str(int(ss * 100 / 31 + 0.5)) + "%")
 except Exception as e:
 	os.close(modem)
 	raise e
